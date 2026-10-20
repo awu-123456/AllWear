@@ -58,7 +58,7 @@ mybatis-plus:
       id-type: auto # 主键自增
 
 jwt:
-  secret: abcdefghijklmnopqrstuvwxyz123456
+  secret:  ${JWT_SECRET}
   expiration: 2
 
 aliyun:
