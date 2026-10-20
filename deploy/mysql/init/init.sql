@@ -1,0 +1,1 @@
+source /opt/sql/inituser.sql;
