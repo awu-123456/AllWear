@@ -34,4 +34,14 @@ public class VerificationCodeService {
         return redisTemplate.hasKey(key);
     }
 
+    public boolean verifyCode(String email, String code) {
+        String key = Code_KEY_PREFIX + email;
+        if (redisTemplate.hasKey(key)) {
+            return code.equals(redisTemplate.opsForValue().get(key));
+        } else {
+            log.warn("验证码不存在或已过期，邮箱{}",email);
+            return false;
+        }
+    }
+
 }

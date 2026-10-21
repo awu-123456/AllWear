@@ -13,7 +13,7 @@ spring:
   # MySQL数据源配置
   datasource:
     url: jdbc:mysql://101.43.87.239:3307/bite_wear?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true&characterEncoding=utf8
-    username: bite
+    username:
     password:
     driver-class-name: com.mysql.cj.jdbc.Driver
 
@@ -58,7 +58,7 @@ mybatis-plus:
       id-type: auto # 主键自增
 
 jwt:
-  secret:  ${JWT_SECRET}
+  secret:
   expiration: 2
 
 aliyun:
@@ -66,8 +66,8 @@ aliyun:
     endpoint: oss-cn-beijing.aliyuncs.com
     access-key-id:
     access-key-secret:
-    bucket-name: bite-lz
-    max-size: 52428800
+    bucket-name:
+    max-size:
 
 
 # 自定义日志配置
