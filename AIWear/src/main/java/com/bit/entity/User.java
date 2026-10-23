@@ -13,6 +13,7 @@ public class User {
     @TableId(type = IdType.AUTO)
     private Long id;
 
+    @TableField("username")
     private String userName;
 
     private String email;

@@ -13,7 +13,7 @@ spring:
   # MySQL数据源配置
   datasource:
     url: jdbc:mysql://101.43.87.239:3307/bite_wear?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true&characterEncoding=utf8
-    username:
+    username: bite
     password:
     driver-class-name: com.mysql.cj.jdbc.Driver
 
@@ -66,11 +66,19 @@ aliyun:
     endpoint: oss-cn-beijing.aliyuncs.com
     access-key-id:
     access-key-secret:
-    bucket-name:
-    max-size:
+    bucket-name: allwear
+    max-size: 52428800
+
+file:
+  upload-dir: uploads/images
 
 
 # 自定义日志配置
 logging:
   pattern:
     console: "%clr(%d{HH:mm:ss.SSS}){faint} %clr(%5p) %clr(${PID:- }){magenta} %clr(---){faint} %clr([%15.15t]){cyan} %clr(%-40.40logger{39}){cyan} %clr(:){faint} %m%n%wEx"
+# Python AI服务，超时单位为毫秒
+python:
+  base-url: ${PYTHON_BASE_URL:http://localhost:5000}
+  connect-timeout: 5000
+  read-timeout: 180000

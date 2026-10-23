@@ -9,12 +9,15 @@ from io import BytesIO
 from threading import Lock
 from urllib.parse import urlparse
 
+import redis
+import requests
 from PIL import Image
 from deepagents import create_deep_agent
 from flask import Flask, request, jsonify
 from flask.cli import load_dotenv
 from dashscope import MultiModalConversation
 from langchain_community.chat_models import ChatTongyi
+from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
@@ -26,6 +29,26 @@ app = Flask(__name__)
 load_dotenv()
 
 API_KEY = os.getenv("DASHSCOPE_API_KEY")
+REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "8888"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+REDIS_TIMEOUT_SECONDS = float(os.getenv("REDIS_TIMEOUT_MS", "2000")) / 1000.0
+REDIS_POOL_MAX_ACTIVE = int(os.getenv("REDIS_POOL_MAX_ACTIVE", "8"))
+CLIP_MODEL_DIR = os.getenv(
+    "CLIP_MODEL_DIR",
+    r"C:\Users\liyibo\.cache\modelscope\models\openai-mirror--clip-vit-base-patch16",
+)
+CLIP_VECTOR_DIM = 512
+REDIS_IMAGE_KEY = "wear:image:{id}"
+REDIS_ALL_IMAGES_KEY = "wear:images"
+REDIS_USER_IMAGES_KEY = "wear:user:{userId}:images"
+
+_redis_client = None
+_redis_lock = Lock()
+_clip_model = None
+_clip_processor = None
+_clip_device = None
+_clip_lock = Lock()
 
 
 # 将图片bytes转换成base_uri
@@ -143,7 +166,13 @@ def validate_image(image_desc: str) -> bool:
 @app.route('/api/validate-image', methods=['POST'])
 def validate_image_api():
     try:
-        file = request.files["file"]
+        file = request.files.get("file")
+        if file is None:
+            return jsonify({
+                "code": 400,
+                "allow": False,
+                "error": "file 必须上传图片文件"
+            }), 400
         image_data = file.read()
 
         desc = describe_image(image_data)  # 调用大模型生成图片文字描述信息
@@ -464,6 +493,231 @@ def skill_image_api():
     except Exception as exc:
         app.logger.error("调用skill处理失败：%s", type(exc).__name__)
         return jsonify({"success": False, "error": "图片处理服务异常，请稍后重试"}), 500
+
+
+def resolve_clip_model_dir() -> str:
+    path = CLIP_MODEL_DIR
+    if os.path.isfile(os.path.join(path, "config.json")):
+        return path
+    for snapshot in ("master", "main"):
+        candidate = os.path.join(path, "snapshots", snapshot)
+        if os.path.isfile(os.path.join(candidate, "config.json")):
+            return candidate
+    raise ImageServiceError("CLIP 模型文件未找到，请检查本地模型目录")
+
+
+def get_clip():
+    """延迟加载本地 clip-vit-base-patch16，避免导入阶段占用显存。"""
+    global _clip_model, _clip_processor, _clip_device
+    if _clip_model is not None:
+        return _clip_model, _clip_processor, _clip_device
+    with _clip_lock:
+        if _clip_model is not None:
+            return _clip_model, _clip_processor, _clip_device
+        try:
+            import torch
+            from transformers import CLIPModel, CLIPProcessor
+
+            model_dir = resolve_clip_model_dir()
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model = CLIPModel.from_pretrained(model_dir)
+            try:
+                processor = CLIPProcessor.from_pretrained(model_dir)
+            except Exception:
+                from transformers import CLIPImageProcessor, CLIPTokenizer
+
+                processor = CLIPProcessor(
+                    image_processor=CLIPImageProcessor.from_pretrained(model_dir),
+                    tokenizer=CLIPTokenizer.from_pretrained(model_dir),
+                )
+            model.eval()
+            model.to(device)
+            _clip_model, _clip_processor, _clip_device = model, processor, device
+        except ImageServiceError:
+            raise
+        except Exception as exc:
+            app.logger.error("CLIP 模型加载失败：%s", type(exc).__name__)
+            raise ImageServiceError("CLIP 模型加载失败，请检查本地模型文件") from None
+        return _clip_model, _clip_processor, _clip_device
+
+
+def get_redis():
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+    with _redis_lock:
+        if _redis_client is None:
+            pool = redis.ConnectionPool(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                db=REDIS_DB,
+                max_connections=REDIS_POOL_MAX_ACTIVE,
+                socket_timeout=REDIS_TIMEOUT_SECONDS,
+                socket_connect_timeout=REDIS_TIMEOUT_SECONDS,
+                decode_responses=True,
+            )
+            _redis_client = redis.Redis(connection_pool=pool)
+        return _redis_client
+
+
+def download_image_from_url(url: str) -> bytes:
+    if not valid_image_url(url):
+        raise ImageInputError("ossUrl 必须是有效的 http/https 地址")
+    try:
+        response = requests.get(url, timeout=20, stream=True)
+        response.raise_for_status()
+        chunks = []
+        size = 0
+        for chunk in response.iter_content(8192):
+            if not chunk:
+                continue
+            size += len(chunk)
+            if size > MAX_IMAGE_BYTES:
+                raise ImageInputError("图片不能超过10MB")
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        if not data:
+            raise ImageInputError("ossUrl 对应的图片为空")
+        with Image.open(BytesIO(data)) as image:
+            if image.format not in {"JPEG", "PNG", "WEBP", "BMP", "GIF"}:
+                raise ImageInputError("ossUrl 图片格式不支持，请使用JPEG、PNG、WEBP、BMP或GIF")
+            image.verify()
+        return data
+    except ImageInputError:
+        raise
+    except requests.RequestException:
+        raise ImageServiceError("下载 OSS 图片失败，请检查地址是否可访问") from None
+    except (OSError, ValueError, SyntaxError):
+        raise ImageInputError("ossUrl 不是有效图片") from None
+
+
+def extract_llm_text(content) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        texts = []
+        for item in content:
+            if isinstance(item, str) and item.strip():
+                texts.append(item.strip())
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    texts.append(text.strip())
+        return "\n".join(texts).strip()
+    return ""
+
+
+def describe_image_with_qwen_vl(oss_url: str) -> str:
+    """使用 LangChain 调用 qwen3-vl-plus，生成可供文搜图使用的图片描述。"""
+    if not API_KEY:
+        raise ImageServiceError("图片描述服务未就绪，请检查 API 密钥")
+    prompt = (
+        "请用简洁中文描述这张图片的主要内容。"
+        "重点说明服饰类型、颜色、款式、图案、材质以及人物或场景特征，"
+        "便于后续按文字检索。不要输出多余解释。"
+    )
+    llm = ChatTongyi(
+        model_name="qwen3-vl-plus",
+        temperature=0.2,
+        dashscope_api_key=API_KEY,
+    )
+    message = HumanMessage(content=[
+        {"image": oss_url},
+        {"text": prompt},
+    ])
+    try:
+        response = llm.invoke([message])
+    except Exception as exc:
+        app.logger.error("qwen3-vl-plus 调用失败：%s", type(exc).__name__)
+        raise ImageServiceError("图片描述模型调用失败，请稍后重试") from None
+    description = extract_llm_text(getattr(response, "content", None))
+    if not description:
+        raise ImageServiceError("图片描述模型未返回有效内容")
+    return description
+
+
+def encode_image_vector(image_data: bytes) -> list[float]:
+    """使用本地 CLIP 将图片编码为 L2 归一化的 512 维向量，便于图搜图/文搜图。"""
+    import torch
+
+    model, processor, device = get_clip()
+    image = Image.open(BytesIO(image_data)).convert("RGB")
+    inputs = processor(images=image, return_tensors="pt")
+    inputs = {key: value.to(device) for key, value in inputs.items()}
+    try:
+        with torch.no_grad():
+            features = model.get_image_features(**inputs)
+            # 兼容新版 Transformers 的模型输出对象和旧版 Tensor 返回值。
+            if not isinstance(features, torch.Tensor):
+                features = features.pooler_output
+            features = torch.nn.functional.normalize(features, p=2, dim=-1)
+        vector = features.squeeze(0).detach().cpu().tolist()
+    except Exception as exc:
+        app.logger.error("CLIP 向量化失败：%s", type(exc).__name__)
+        raise ImageServiceError("图片向量化失败，请稍后重试") from None
+    if len(vector) != CLIP_VECTOR_DIM:
+        raise ImageServiceError("CLIP 向量维度异常")
+    return vector
+
+
+def save_image_index(record: dict) -> None:
+    try:
+        client = get_redis()
+        image_id = record["id"]
+        payload = json.dumps(record, ensure_ascii=False)
+        pipeline = client.pipeline()
+        pipeline.set(REDIS_IMAGE_KEY.format(id=image_id), payload)
+        pipeline.sadd(REDIS_ALL_IMAGES_KEY, image_id)
+        pipeline.sadd(REDIS_USER_IMAGES_KEY.format(userId=record["userId"]), image_id)
+        pipeline.execute()
+    except redis.RedisError:
+        app.logger.error("Redis 写入失败")
+        raise ImageServiceError("图片索引写入 Redis 失败") from None
+
+
+@app.route("/api/upload-image", methods=["POST"])
+def upload_image_api():
+    try:
+        payload = request.get_json(silent=True) if request.is_json else None
+        if request.is_json and not isinstance(payload, dict):
+            raise ImageInputError("请求 JSON 必须是对象")
+        if not payload:
+            payload = request.form.to_dict() if request.form else {}
+        user_id = str(payload.get("userId") or "").strip()
+        oss_url = str(payload.get("ossUrl") or payload.get("oss_url") or "").strip()
+        if not user_id:
+            raise ImageInputError("userId 不能为空")
+        if not oss_url:
+            raise ImageInputError("ossUrl 不能为空")
+
+        image_data = download_image_from_url(oss_url)
+        description = describe_image_with_qwen_vl(oss_url)
+        vector = encode_image_vector(image_data)
+        image_id = uuid.uuid4().hex
+        record = {
+            "id": image_id,
+            "userId": user_id,
+            "ossUrl": oss_url,
+            "description": description,
+            "vector": vector,
+        }
+        save_image_index(record)
+        return jsonify({
+            "code": 200,
+            "id": image_id,
+            "userId": user_id,
+            "ossUrl": oss_url,
+            "description": description,
+            "vectorDim": len(vector),
+        }), 200
+    except ImageInputError as exc:
+        return jsonify({"code": 400, "error": str(exc)}), 400
+    except ImageServiceError as exc:
+        return jsonify({"code": 500, "error": str(exc)}), 500
+    except Exception:
+        app.logger.exception("上传图片索引失败")
+        return jsonify({"code": 500, "error": "图片上传处理失败，请稍后重试"}), 500
+
 
 # 服务器启动函数
 if __name__ == '__main__':

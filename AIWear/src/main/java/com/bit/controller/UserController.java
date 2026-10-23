@@ -36,4 +36,15 @@ public class UserController {
     public Result<AuthResponse> auth(@RequestBody @Valid AuthRequest request) {
         return Result.success("操作成功", userService.auth(request));
     }
+
+    @ApiLog
+    @PostMapping("/logout")
+    public Result<String> logout(@RequestHeader(value = "Authorization")  String authorization) {
+        boolean success = userService.logout(authorization);
+        if(success) {
+            return Result.success("退出成功", "退出成功");
+        } else {
+            return Result.serverError("退出失败，请稍后重试");
+        }
+    }
 }

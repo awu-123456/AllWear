@@ -9,4 +9,6 @@ public interface UserService {
     boolean sendVerificationCode(SendVerificationCodeRequest request);
 
     AuthResponse auth(@Valid AuthRequest request);
+
+    boolean logout(String authorization);
 }

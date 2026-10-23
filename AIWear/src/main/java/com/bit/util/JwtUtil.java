@@ -1,6 +1,7 @@
 package com.bit.util;
 
 import com.bit.entity.User;
+import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.security.Keys;
 import lombok.extern.slf4j.Slf4j;
@@ -55,6 +56,47 @@ public class JwtUtil {
                         expiration,
                         TimeUnit.HOURS
                 );
-        return "";
+        return token;
     }
+
+    public String parseToken(String authorization) {
+        if(authorization == null || authorization.isBlank()) {
+            throw new RuntimeException("缺少请求头令牌！");
+        }
+        return authorization.substring(7);
+    }
+
+    private Claims getClaims(String token) {
+        SecretKey key = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+        return Jwts.parser()
+                .setSigningKey(key)
+                .build()
+                .parseClaimsJws(token)
+                .getBody();
+    }
+
+    public boolean removeToken(String token) {
+        if(token == null || token.isBlank()) {
+            return true;
+        }
+        Claims claims = getClaims(token);
+        Long userId = Long.parseLong(claims.get("userId").toString());
+        String userKey = USER_TOKEN_KEY_PREFIX + userId;
+        if(redisTemplate.hasKey(userKey)) {
+            return redisTemplate.delete(userKey);
+        }
+        return false;
+    }
+
+    public Long getUserId(String token) {
+        Claims claims = getClaims(token);
+        Long userId = Long.parseLong(claims.get("userId").toString());
+        String userKey = USER_TOKEN_KEY_PREFIX + userId;
+        String cachedToken = redisTemplate.opsForValue().get(userKey);
+        if (cachedToken == null || !cachedToken.equals(token)) {
+            throw new RuntimeException("令牌无效或已过期！");
+        }
+        return userId;
+    }
+
 }

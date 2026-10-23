@@ -52,3 +52,5 @@ AIWearPython/wheels/
 **/*.key
 **/*.p12
 **/*.jks
+
+AIWear/uploads/images/
