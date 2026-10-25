@@ -1,7 +1,11 @@
 package com.bit.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.bit.dto.request.EditImageRequest;
+import com.bit.dto.request.SearchImageRequest;
+import com.bit.dto.response.EditImageResponse;
 import com.bit.dto.response.ImageUploadResponse;
+import com.bit.dto.response.SearchImageResponse;
 import com.bit.entity.FileInfo;
 import com.bit.mapper.FileMapper;
 import com.bit.service.FileService;
@@ -20,10 +24,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.List;
-import java.util.Locale;
-import java.util.Set;
-import java.util.UUID;
+import java.util.*;
 
 @Slf4j
 @Service
@@ -133,6 +134,32 @@ public class FileServiceImpl implements FileService {
         return fileMapper.selectList(queryWrapper);
     }
 
+    @Override
+    public List<SearchImageResponse> search(String authorization, SearchImageRequest searchImageRequest) {
+        String token = jwtUtil.parseToken(authorization);
+        Long userId = jwtUtil.getUserId(token);
+        List<FileInfo> myImages = myImages(authorization);
+        Map<String, String> map = new HashMap<>();
+        for (FileInfo fileInfo : myImages) {
+            map.put(fileInfo.getOssUrl(), fileInfo.getFileName());
+        }
+        List<SearchImageResponse> searchImageResponseList = pythonService.search(userId, searchImageRequest);
+        for (SearchImageResponse searchImageResponse : searchImageResponseList) {
+            searchImageResponse.setFileName(map.get(searchImageResponse.getFilePath()));
+        }
+        return searchImageResponseList;
+    }
+
+    @Override
+    public EditImageResponse edit(String authorization, EditImageRequest editImageRequest) {
+        List<FileInfo> myImages = myImages(authorization);
+        List<String> urls = myImages.stream().map(FileInfo::getOssUrl).toList();
+        if(!urls.contains(editImageRequest.getImage())) {
+            throw new RuntimeException("只能编辑自己上传的图片");
+        }
+        return pythonService.edit(editImageRequest);
+    }
+
     private void validateFile(MultipartFile file) {
         if (file == null || file.isEmpty()) {
             throw new RuntimeException("图片文件不能为空");
@@ -160,4 +187,5 @@ public class FileServiceImpl implements FileService {
         }
         return filename.substring(index + 1).toLowerCase(Locale.ROOT);
     }
+
 }

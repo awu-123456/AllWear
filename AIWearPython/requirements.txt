@@ -26,3 +26,5 @@ deepagents==0.3.9
 
 # Environment configuration
 python-dotenv==1.2.1
+# Local Chinese text search
+scikit-learn==1.8.0

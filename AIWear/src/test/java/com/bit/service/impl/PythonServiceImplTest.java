@@ -1,5 +1,7 @@
 package com.bit.service.impl;
 
+import com.bit.dto.request.SearchImageRequest;
+import org.springframework.mock.web.MockMultipartFile;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpMethod;
@@ -87,6 +89,80 @@ class PythonServiceImplTest {
         assertThrows(RuntimeException.class, () -> service.validateImage(file));
         assertThrows(RuntimeException.class, () -> service.validateImage(file));
         assertThrows(RuntimeException.class, () -> service.validateImage(file));
+        server.verify();
+    }
+    @Test
+    void searchSendsUserIdAndReadsDataArrayInOrder() {
+        server.expect(requestTo("http://localhost:5000/api/search-image"))
+                .andExpect(method(HttpMethod.POST))
+                .andExpect(content().contentTypeCompatibleWith(MediaType.MULTIPART_FORM_DATA))
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("name=\"userId\"")))
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("123")))
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("name=\"query\"")))
+                .andRespond(withSuccess("{\"code\":200,\"message\":\"ok\",\"data\":["
+                        + "{\"filePath\":\"https://oss.test/a.png\",\"similarity\":0.9},"
+                        + "{\"filePath\":\"https://oss.test/b.png\",\"similarity\":0.8}]}", MediaType.APPLICATION_JSON));
+        SearchImageRequest request = new SearchImageRequest();
+        request.setQuery("上衣");
+        var results = service.search(123L, request);
+        assertEquals(2, results.size());
+        assertEquals("https://oss.test/a.png", results.get(0).getFilePath());
+        assertEquals("https://oss.test/b.png", results.get(1).getFilePath());
+        server.verify();
+    }
+
+    @Test
+    void searchSendsActualImageFile() {
+        server.expect(requestTo("http://localhost:5000/api/search-image"))
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("name=\"userId\"")))
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("name=\"file\"; filename=\"photo.png\"")))
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("image-content")))
+                .andRespond(withSuccess("{\"code\":200,\"data\":[]}", MediaType.APPLICATION_JSON));
+        SearchImageRequest request = new SearchImageRequest();
+        request.setFile(new MockMultipartFile("file", "photo.png", "image/png", "image-content".getBytes()));
+        assertTrue(service.search(123L, request).isEmpty());
+        server.verify();
+    }
+
+    @Test
+    void searchDistinguishesEmptySuccessFromInvalidResponses() {
+        String[] responses = {"{\"code\":200,\"data\":[]}", "{\"code\":500,\"data\":[]}",
+                "{\"code\":200}", "{\"code\":200,\"data\":{}}", "null", "not json", "",
+                "{\"code\":200,\"data\":[{}]}", "{\"data\":[]}"};
+        for (String response : responses) {
+            server.expect(requestTo("http://localhost:5000/api/search-image"))
+                    .andRespond(withSuccess(response, MediaType.APPLICATION_JSON));
+        }
+        SearchImageRequest request = new SearchImageRequest();
+        request.setQuery("上衣");
+        assertTrue(service.search(123L, request).isEmpty());
+        for (int index = 1; index < responses.length; index++) {
+            assertThrows(RuntimeException.class, () -> service.search(123L, request));
+        }
+        server.verify();
+    }
+
+    @Test
+    void searchHttpErrorsAreNotEmptyResults() {
+        server.expect(requestTo("http://localhost:5000/api/search-image"))
+                .andRespond(withStatus(HttpStatus.BAD_REQUEST));
+        server.expect(requestTo("http://localhost:5000/api/search-image"))
+                .andRespond(withStatus(HttpStatus.INTERNAL_SERVER_ERROR));
+        SearchImageRequest request = new SearchImageRequest();
+        request.setQuery("上衣");
+        assertThrows(RuntimeException.class, () -> service.search(123L, request));
+        assertThrows(RuntimeException.class, () -> service.search(123L, request));
+        server.verify();
+    }
+
+    @Test
+    void searchTimeoutIsNotEmptyResult() {
+        server.expect(requestTo("http://localhost:5000/api/search-image"))
+                .andRespond(withException(new java.net.SocketTimeoutException("SECRET endpoint")));
+        SearchImageRequest request = new SearchImageRequest();
+        request.setQuery("上衣");
+        RuntimeException error = assertThrows(RuntimeException.class, () -> service.search(123L, request));
+        assertFalse(error.getMessage().contains("SECRET"));
         server.verify();
     }
 }

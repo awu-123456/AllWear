@@ -1,5 +1,7 @@
 import base64
 import json
+import math
+import re
 import os
 import tempfile
 import uuid
@@ -717,6 +719,143 @@ def upload_image_api():
     except Exception:
         app.logger.exception("上传图片索引失败")
         return jsonify({"code": 500, "error": "图片上传处理失败，请稍后重试"}), 500
+
+
+# 检索只读取现有索引，不修改上传数据或重新调用云端模型。
+MAX_SEARCH_REQUEST_BYTES = MAX_IMAGE_BYTES + 1024 * 1024
+
+
+def read_user_image_records(user_id: str) -> list[dict]:
+    try:
+        client = get_redis()
+        image_ids = sorted(client.smembers(REDIS_USER_IMAGES_KEY.format(userId=user_id)))
+        records = []
+        # 分批读取详情，避免每张图片单独访问 Redis。
+        for start in range(0, len(image_ids), 200):
+            keys = [REDIS_IMAGE_KEY.format(id=image_id) for image_id in image_ids[start:start + 200]]
+            for value in client.mget(keys):
+                if value is None:
+                    continue
+                try:
+                    record = json.loads(value)
+                except (ValueError, TypeError):
+                    continue
+                if (not isinstance(record, dict) or str(record.get("userId")) != user_id
+                        or not valid_image_url(record.get("ossUrl"))):
+                    continue
+                records.append(record)
+        return records
+    except redis.RedisError:
+        app.logger.error("Redis 读取图片索引失败")
+        raise ImageServiceError("图片索引读取失败") from None
+
+
+def normalize_search_vector(value):
+    """拒绝损坏的向量；缩放后归一化，避免极大或极小数值溢出。"""
+    if not isinstance(value, list) or len(value) != CLIP_VECTOR_DIM:
+        return None
+    try:
+        if any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in value):
+            return None
+        vector = [float(item) for item in value]
+        if not all(math.isfinite(item) for item in vector):
+            return None
+        scale = max(abs(item) for item in vector)
+        if scale == 0:
+            return None
+        vector = [item / scale for item in vector]
+        norm = math.hypot(*vector)
+        return [item / norm for item in vector]
+    except (ValueError, OverflowError):
+        return None
+
+
+def search_text_scores(query: str, records: list[dict]) -> list[tuple]:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    candidates = [record for record in records
+                  if isinstance(record.get("description"), str) and record["description"].strip()]
+    if not candidates:
+        return []
+    # 查询和本用户的描述使用同一词表、同一 IDF；保留单字和双字特征。
+    vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(1, 2), norm="l2")
+    try:
+        matrix = vectorizer.fit_transform([query, *[record["description"].strip() for record in candidates]])
+    except ValueError as exc:
+        if "empty vocabulary" in str(exc):
+            return []
+        raise
+    scores = cosine_similarity(matrix[0:1], matrix[1:]).ravel()
+    return [(record["ossUrl"], float(score)) for record, score in zip(candidates, scores)]
+
+
+def search_image_scores(vector: list[float], records: list[dict]) -> list[tuple]:
+    query_vector = normalize_search_vector(vector)
+    if query_vector is None:
+        raise ImageServiceError("查询图片向量异常")
+    scores = []
+    for record in records:
+        candidate = normalize_search_vector(record.get("vector"))
+        if candidate is None:
+            continue
+        score = math.fsum(left * right for left, right in zip(query_vector, candidate))
+        scores.append((record["ossUrl"], max(-1.0, min(1.0, score))))
+    return scores
+
+
+def search_image() -> list[dict]:
+    if request.mimetype != "multipart/form-data":
+        raise ImageInputError("请求必须使用 multipart/form-data")
+    request.max_content_length = MAX_SEARCH_REQUEST_BYTES
+    if set(request.form) - {"userId", "query"} or set(request.files) - {"file"}:
+        raise ImageInputError("存在未知字段，图片必须通过 file 上传")
+    if any(len(request.form.getlist(key)) != 1 for key in request.form):
+        raise ImageInputError("请求参数不能重复")
+    user_ids = request.form.getlist("userId")
+    if len(user_ids) != 1 or not re.fullmatch(r"[1-9][0-9]*", user_ids[0]):
+        raise ImageInputError("userId 必须是正整数字符串")
+    user_id = user_ids[0]
+    files = request.files.getlist("file")
+    has_query = "query" in request.form
+    if len(files) > 1 or bool(files) == has_query:
+        raise ImageInputError("file 和 query 必须且只能提供一个")
+    if has_query:
+        query = request.form["query"].strip()
+        if not query:
+            raise ImageInputError("query 不能为空白")
+        if len(query) > 6000:
+            raise ImageInputError("query 不能超过6000个字符")
+        scores = search_text_scores(query, read_user_image_records(user_id))
+        threshold = 0.1
+    else:
+        with tempfile.TemporaryDirectory(prefix="aiwear_search_") as directory:
+            path = save_uploaded_image(files[0], directory, "file")
+            with open(path, "rb") as image_file:
+                vector = encode_image_vector(image_file.read())
+            scores = search_image_scores(vector, read_user_image_records(user_id))
+        threshold = 0.7
+    # 使用原始分数过滤和排序，最后才保留四位小数；同分按 URL 排序。
+    matches = [(url, score) for url, score in scores if math.isfinite(score) and score > threshold]
+    matches.sort(key=lambda item: (-item[1], item[0]))
+    return [{"filePath": url, "similarity": round(score, 4)} for url, score in matches]
+
+
+@app.route("/api/search-image", methods=["POST"])
+def search_image_api():
+    try:
+        return jsonify({"code": 200, "message": "查询成功", "data": search_image()}), 200
+    except (ImageInputError, BadRequest, RequestEntityTooLarge) as exc:
+        if isinstance(exc, RequestEntityTooLarge):
+            message = "上传请求过大"
+        elif isinstance(exc, BadRequest):
+            message = "multipart/form-data 请求格式错误"
+        else:
+            message = str(exc)
+        return jsonify({"code": 400, "message": message, "data": []}), 400
+    except Exception as exc:
+        app.logger.error("图片检索失败：%s", type(exc).__name__)
+        return jsonify({"code": 500, "message": "图片检索服务异常，请稍后重试", "data": []}), 500
 
 
 # 服务器启动函数
